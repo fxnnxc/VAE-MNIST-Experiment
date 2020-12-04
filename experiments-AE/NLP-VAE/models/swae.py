@@ -2,32 +2,28 @@ import torch
 from models import BaseVAE
 from torch import nn
 from torch.nn import functional as F
+from torch import distributions as dist
 from .types_ import *
 
 
-class BetaVAE(BaseVAE):
-
-    num_iter = 0 # Global static variable to keep track of iterations
+class SWAE(BaseVAE):
 
     def __init__(self,
                  in_channels: int,
                  latent_dim: int,
                  hidden_dims: List = None,
-                 beta: int = 4,
-                 gamma:float = 1000.,
-                 max_capacity: int = 25,
-                 Capacity_max_iter: int = 1e5,
-                 loss_type:str = 'B',
-                 input_size = 32,
-                 **kwargs) -> None:
-        super(BetaVAE, self).__init__()
+                 reg_weight: int = 100,
+                 wasserstein_deg: float= 2.,
+                 num_projections: int = 50,
+                 projection_dist: str = 'normal',
+                    **kwargs) -> None:
+        super(SWAE, self).__init__()
 
         self.latent_dim = latent_dim
-        self.beta = beta
-        self.gamma = gamma
-        self.loss_type = loss_type
-        self.C_max = torch.Tensor([max_capacity])
-        self.C_stop_iter = Capacity_max_iter
+        self.reg_weight = reg_weight
+        self.p = wasserstein_deg
+        self.num_projections = num_projections
+        self.proj_dist = projection_dist
 
         modules = []
         if hidden_dims is None:
@@ -45,14 +41,13 @@ class BetaVAE(BaseVAE):
             in_channels = h_dim
 
         self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(hidden_dims[-1], latent_dim)
-        self.fc_var = nn.Linear(hidden_dims[-1], latent_dim)
+        self.fc_z = nn.Linear(hidden_dims[-1]*4, latent_dim)
 
 
         # Build Decoder
         modules = []
 
-        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1])
+        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 4)
 
         hidden_dims.reverse()
 
@@ -86,7 +81,7 @@ class BetaVAE(BaseVAE):
                                       kernel_size= 3, padding= 1),
                             nn.Tanh())
 
-    def encode(self, input: Tensor) -> List[Tensor]:
+    def encode(self, input: Tensor) -> Tensor:
         """
         Encodes the input by passing through the encoder network
         and returns the latent codes.
@@ -98,62 +93,90 @@ class BetaVAE(BaseVAE):
 
         # Split the result into mu and var components
         # of the latent Gaussian distribution
-        mu = self.fc_mu(result)
-        log_var = self.fc_var(result)
-
-        return [mu, log_var]
+        z = self.fc_z(result)
+        return z
 
     def decode(self, z: Tensor) -> Tensor:
         result = self.decoder_input(z)
-        result = result.view(-1, 512, 1, 1)
+        result = result.view(-1, 512, 2, 2)
         result = self.decoder(result)
         result = self.final_layer(result)
         return result
 
-    def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
-        """
-        Will a single z be enough ti compute the expectation
-        for the loss??
-        :param mu: (Tensor) Mean of the latent Gaussian
-        :param logvar: (Tensor) Standard deviation of the latent Gaussian
-        :return:
-        """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return eps * std + mu
-
-    def forward(self, input: Tensor, **kwargs) -> Tensor:
-        mu, log_var = self.encode(input)
-        z = self.reparameterize(mu, log_var)
-        return  [self.decode(z), input, mu, log_var]
+    def forward(self, input: Tensor, **kwargs) -> List[Tensor]:
+        z = self.encode(input)
+        return  [self.decode(z), input, z]
 
     def loss_function(self,
                       *args,
                       **kwargs) -> dict:
-        self.num_iter += 1
         recons = args[0]
         input = args[1]
-        mu = args[2]
-        log_var = args[3]
+        z = args[2]
 
+        batch_size = input.size(0)
+        bias_corr = batch_size *  (batch_size - 1)
+        reg_weight = self.reg_weight / bias_corr
 
+        recons_loss_l2 = F.mse_loss(recons, input)
+        recons_loss_l1 = F.l1_loss(recons, input)
 
-        kld_weight = kwargs['M_N']  # Account for the minibatch samples from the dataset
+        swd_loss = self.compute_swd(z, self.p, reg_weight)
 
-        recons_loss =F.mse_loss(recons, input)
+        loss = recons_loss_l2 + recons_loss_l1 + swd_loss
+        return {'loss': loss, 'Reconstruction_Loss':(recons_loss_l2 + recons_loss_l1), 'SWD': swd_loss}
 
-        kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+    def get_random_projections(self, latent_dim: int, num_samples: int) -> Tensor:
+        """
+        Returns random samples from latent distribution's (Gaussian)
+        unit sphere for projecting the encoded samples and the
+        distribution samples.
 
-        if self.loss_type == 'H': # https://openreview.net/forum?id=Sy2fzU9gl
-            loss = recons_loss + self.beta * kld_weight * kld_loss
-        elif self.loss_type == 'B': # https://arxiv.org/pdf/1804.03599.pdf
-            self.C_max = self.C_max.to(input.device)
-            C = torch.clamp(self.C_max/self.C_stop_iter * self.num_iter, 0, self.C_max.data[0])
-            loss = recons_loss + self.gamma * kld_weight* (kld_loss - C).abs()
+        :param latent_dim: (Int) Dimensionality of the latent space (D)
+        :param num_samples: (Int) Number of samples required (S)
+        :return: Random projections from the latent unit sphere
+        """
+        if self.proj_dist == 'normal':
+            rand_samples = torch.randn(num_samples, latent_dim)
+        elif self.proj_dist == 'cauchy':
+            rand_samples = dist.Cauchy(torch.tensor([0.0]),
+                                       torch.tensor([1.0])).sample((num_samples, latent_dim)).squeeze()
         else:
-            raise ValueError('Undefined loss type.')
+            raise ValueError('Unknown projection distribution.')
 
-        return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':kld_loss}
+        rand_proj = rand_samples / rand_samples.norm(dim=1).view(-1,1)
+        return rand_proj # [S x D]
+
+
+    def compute_swd(self,
+                    z: Tensor,
+                    p: float,
+                    reg_weight: float) -> Tensor:
+        """
+        Computes the Sliced Wasserstein Distance (SWD) - which consists of
+        randomly projecting the encoded and prior vectors and computing
+        their Wasserstein distance along those projections.
+
+        :param z: Latent samples # [N  x D]
+        :param p: Value for the p^th Wasserstein distance
+        :param reg_weight:
+        :return:
+        """
+        prior_z = torch.randn_like(z) # [N x D]
+        device = z.device
+
+        proj_matrix = self.get_random_projections(self.latent_dim,
+                                                  num_samples=self.num_projections).transpose(0,1).to(device)
+
+        latent_projections = z.matmul(proj_matrix) # [N x S]
+        prior_projections = prior_z.matmul(proj_matrix) # [N x S]
+
+        # The Wasserstein distance is computed by sorting the two projections
+        # across the batches and computing their element-wise l2 distance
+        w_dist = torch.sort(latent_projections.t(), dim=1)[0] - \
+                 torch.sort(prior_projections.t(), dim=1)[0]
+        w_dist = w_dist.pow(p)
+        return reg_weight * w_dist.mean()
 
     def sample(self,
                num_samples:int,

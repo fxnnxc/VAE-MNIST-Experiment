@@ -5,7 +5,47 @@ from torch.nn import functional as F
 from .types_ import *
 
 
-class BetaVAE(BaseVAE):
+
+class EncoderRNN(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(EncoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+
+        #self.embedding = nn.Embedding(input_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size)
+
+    def forward(self, input, hidden):
+        #embedded = self.embedding(input).view(1, 1, -1)
+        #output = embedded
+        output, hidden = self.gru(input, hidden)
+        return output, hidden
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size) #device= device)
+
+class DecoderRNN(nn.Module):
+    def __init__(self, hidden_size, output_size):
+        super(DecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+
+        #self.embedding = nn.Embedding(output_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size)
+        #self.out = nn.Linear(hidden_size, output_size)
+        #self.softmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, input, hidden):
+        #output = self.embedding(input).view(1, 1, -1)
+        #output = F.relu(output)
+        output, hidden = self.gru(input, hidden)
+        #output = self.softmax(self.out(output[0]))
+        return output, hidden
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size)# device=input.device)
+
+
+
+class LSTMBetaVAE(BaseVAE):
 
     num_iter = 0 # Global static variable to keep track of iterations
 
@@ -20,7 +60,7 @@ class BetaVAE(BaseVAE):
                  loss_type:str = 'B',
                  input_size = 32,
                  **kwargs) -> None:
-        super(BetaVAE, self).__init__()
+        super(LSTMBetaVAE, self).__init__()
 
         self.latent_dim = latent_dim
         self.beta = beta
@@ -28,86 +68,55 @@ class BetaVAE(BaseVAE):
         self.loss_type = loss_type
         self.C_max = torch.Tensor([max_capacity])
         self.C_stop_iter = Capacity_max_iter
+        self.use_teacher_forcing = True
+        self.input_size = input_size
 
-        modules = []
         if hidden_dims is None:
-            hidden_dims = [32, 64, 128, 256, 512]
+            hidden_dims = [10]
 
-        # Build Encoder
-        for h_dim in hidden_dims:
-            modules.append(
-                nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels=h_dim,
-                              kernel_size= 3, stride= 2, padding  = 1),
-                    nn.BatchNorm2d(h_dim),
-                    nn.LeakyReLU())
-            )
-            in_channels = h_dim
+        self.encoder = EncoderRNN(input_size, input_size)
+        self.fc_mu = nn.Linear(input_size, latent_dim)
+        self.fc_var = nn.Linear(input_size, latent_dim)
 
-        self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(hidden_dims[-1], latent_dim)
-        self.fc_var = nn.Linear(hidden_dims[-1], latent_dim)
+        self.decoder_input = nn.Linear(latent_dim, input_size)
+        self.decoder = DecoderRNN(input_size, input_size)
 
-
-        # Build Decoder
-        modules = []
-
-        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1])
-
-        hidden_dims.reverse()
-
-        for i in range(len(hidden_dims) - 1):
-            modules.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(hidden_dims[i],
-                                       hidden_dims[i + 1],
-                                       kernel_size=3,
-                                       stride = 2,
-                                       padding=1,
-                                       output_padding=1),
-                    nn.BatchNorm2d(hidden_dims[i + 1]),
-                    nn.LeakyReLU())
-            )
-
-
-
-        self.decoder = nn.Sequential(*modules)
-
-        self.final_layer = nn.Sequential(
-                            nn.ConvTranspose2d(hidden_dims[-1],
-                                               hidden_dims[-1],
-                                               kernel_size=3,
-                                               stride=2,
-                                               padding=1,
-                                               output_padding=1),
-                            nn.BatchNorm2d(hidden_dims[-1]),
-                            nn.LeakyReLU(),
-                            nn.Conv2d(hidden_dims[-1], out_channels= 3,
-                                      kernel_size= 3, padding= 1),
-                            nn.Tanh())
 
     def encode(self, input: Tensor) -> List[Tensor]:
-        """
-        Encodes the input by passing through the encoder network
-        and returns the latent codes.
-        :param input: (Tensor) Input tensor to encoder [N x C x H x W]
-        :return: (Tensor) List of latent codes
-        """
-        result = self.encoder(input)
-        result = torch.flatten(result, start_dim=1)
 
-        # Split the result into mu and var components
-        # of the latent Gaussian distribution
+        encoder_hidden = self.encoder.initHidden()
+        encoder_outputs = torch.zeros(self.input_size, self.encoder.hidden_size)
+
+        for ei in range(self.input_size):
+            print(input[ei].size())
+            encoder_output, encoder_hidden = self.encoder(input[ei], encoder_hidden)
+            encoder_outputs[ei] = encoder_output[0, 0]
+        result = encoder_hidden
+
         mu = self.fc_mu(result)
         log_var = self.fc_var(result)
 
         return [mu, log_var]
 
-    def decode(self, z: Tensor) -> Tensor:
+    def decode(self, z: Tensor, input) -> Tensor:
+
         result = self.decoder_input(z)
-        result = result.view(-1, 512, 1, 1)
-        result = self.decoder(result)
-        result = self.final_layer(result)
+        decoder_input = torch.tensor([[0 for i in range(self.input_size)]])
+        decoder_hidden = result
+
+        if self.use_teacher_forcing:
+            # Teacher forcing: Feed the target as the next input
+            for di in range(self.input_size):
+                decoder_output, decoder_hidden = self.decoder(
+                    decoder_input, decoder_hidden)
+                decoder_input = input[di]  # Teacher forcing
+
+        else:
+            # Without teacher forcing: use its own predictions as the next input
+            for di in range(self.input_size):
+                decoder_output, decoder_hidden = self.decoder(
+                    decoder_input, decoder_hidden)
+        
         return result
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
@@ -136,6 +145,10 @@ class BetaVAE(BaseVAE):
         mu = args[2]
         log_var = args[3]
 
+        print(args[0].size())
+        print(args[1].size())
+        print(args[2].size())
+        print(args[3].size())
 
 
         kld_weight = kwargs['M_N']  # Account for the minibatch samples from the dataset

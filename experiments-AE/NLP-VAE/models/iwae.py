@@ -5,29 +5,18 @@ from torch.nn import functional as F
 from .types_ import *
 
 
-class BetaVAE(BaseVAE):
-
-    num_iter = 0 # Global static variable to keep track of iterations
+class IWAE(BaseVAE):
 
     def __init__(self,
                  in_channels: int,
                  latent_dim: int,
                  hidden_dims: List = None,
-                 beta: int = 4,
-                 gamma:float = 1000.,
-                 max_capacity: int = 25,
-                 Capacity_max_iter: int = 1e5,
-                 loss_type:str = 'B',
-                 input_size = 32,
+                 num_samples: int = 5,
                  **kwargs) -> None:
-        super(BetaVAE, self).__init__()
+        super(IWAE, self).__init__()
 
         self.latent_dim = latent_dim
-        self.beta = beta
-        self.gamma = gamma
-        self.loss_type = loss_type
-        self.C_max = torch.Tensor([max_capacity])
-        self.C_stop_iter = Capacity_max_iter
+        self.num_samples = num_samples
 
         modules = []
         if hidden_dims is None:
@@ -45,14 +34,14 @@ class BetaVAE(BaseVAE):
             in_channels = h_dim
 
         self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(hidden_dims[-1], latent_dim)
-        self.fc_var = nn.Linear(hidden_dims[-1], latent_dim)
+        self.fc_mu = nn.Linear(hidden_dims[-1]*4, latent_dim)
+        self.fc_var = nn.Linear(hidden_dims[-1]*4, latent_dim)
 
 
         # Build Decoder
         modules = []
 
-        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1])
+        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 4)
 
         hidden_dims.reverse()
 
@@ -104,16 +93,23 @@ class BetaVAE(BaseVAE):
         return [mu, log_var]
 
     def decode(self, z: Tensor) -> Tensor:
+        """
+        Maps the given latent codes of S samples
+        onto the image space.
+        :param z: (Tensor) [B x S x D]
+        :return: (Tensor) [B x S x C x H x W]
+        """
+        B, _, _ = z.size()
+        z = z.view(-1, self.latent_dim) #[BS x D]
         result = self.decoder_input(z)
-        result = result.view(-1, 512, 1, 1)
+        result = result.view(-1, 512, 2, 2)
         result = self.decoder(result)
-        result = self.final_layer(result)
+        result = self.final_layer(result) #[BS x C x H x W ]
+        result = result.view([B, -1, result.size(1), result.size(2), result.size(3)]) #[B x S x C x H x W]
         return result
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
         """
-        Will a single z be enough ti compute the expectation
-        for the loss??
         :param mu: (Tensor) Mean of the latent Gaussian
         :param logvar: (Tensor) Standard deviation of the latent Gaussian
         :return:
@@ -122,38 +118,46 @@ class BetaVAE(BaseVAE):
         eps = torch.randn_like(std)
         return eps * std + mu
 
-    def forward(self, input: Tensor, **kwargs) -> Tensor:
+    def forward(self, input: Tensor, **kwargs) -> List[Tensor]:
         mu, log_var = self.encode(input)
-        z = self.reparameterize(mu, log_var)
-        return  [self.decode(z), input, mu, log_var]
+        mu = mu.repeat(self.num_samples, 1, 1).permute(1, 0, 2) # [B x S x D]
+        log_var = log_var.repeat(self.num_samples, 1, 1).permute(1, 0, 2) # [B x S x D]
+        z= self.reparameterize(mu, log_var) # [B x S x D]
+        eps = (z - mu) / log_var # Prior samples
+        return  [self.decode(z), input, mu, log_var, z, eps]
 
     def loss_function(self,
                       *args,
                       **kwargs) -> dict:
-        self.num_iter += 1
+        """
+        KL(N(\mu, \sigma), N(0, 1)) = \log \frac{1}{\sigma} + \frac{\sigma^2 + \mu^2}{2} - \frac{1}{2}
+        :param args:
+        :param kwargs:
+        :return:
+        """
         recons = args[0]
         input = args[1]
         mu = args[2]
         log_var = args[3]
+        z = args[4]
+        eps = args[5]
 
+        input = input.repeat(self.num_samples, 1, 1, 1, 1).permute(1, 0, 2, 3, 4) #[B x S x C x H x W]
 
+        kld_weight = kwargs['M_N'] # Account for the minibatch samples from the dataset
 
-        kld_weight = kwargs['M_N']  # Account for the minibatch samples from the dataset
+        log_p_x_z = ((recons - input) ** 2).flatten(2).mean(-1) # Reconstruction Loss [B x S]
+        kld_loss = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=2) ## [B x S]
+        # Get importance weights
+        log_weight = (log_p_x_z + kld_weight * kld_loss) #.detach().data
 
-        recons_loss =F.mse_loss(recons, input)
+        # Rescale the weights (along the sample dim) to lie in [0, 1] and sum to 1
+        weight = F.softmax(log_weight, dim = -1)
+        # kld_loss = torch.mean(kld_loss, dim = 0)
 
-        kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+        loss = torch.mean(torch.sum(weight * log_weight, dim=-1), dim = 0)
 
-        if self.loss_type == 'H': # https://openreview.net/forum?id=Sy2fzU9gl
-            loss = recons_loss + self.beta * kld_weight * kld_loss
-        elif self.loss_type == 'B': # https://arxiv.org/pdf/1804.03599.pdf
-            self.C_max = self.C_max.to(input.device)
-            C = torch.clamp(self.C_max/self.C_stop_iter * self.num_iter, 0, self.C_max.data[0])
-            loss = recons_loss + self.gamma * kld_weight* (kld_loss - C).abs()
-        else:
-            raise ValueError('Undefined loss type.')
-
-        return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':kld_loss}
+        return {'loss': loss, 'Reconstruction_Loss':log_p_x_z.mean(), 'KLD':-kld_loss.mean()}
 
     def sample(self,
                num_samples:int,
@@ -165,19 +169,20 @@ class BetaVAE(BaseVAE):
         :param current_device: (Int) Device to run the model
         :return: (Tensor)
         """
-        z = torch.randn(num_samples,
+        z = torch.randn(num_samples, 1,
                         self.latent_dim)
 
         z = z.to(current_device)
 
-        samples = self.decode(z)
+        samples = self.decode(z).squeeze()
         return samples
 
     def generate(self, x: Tensor, **kwargs) -> Tensor:
         """
-        Given an input image x, returns the reconstructed image
+        Given an input image x, returns the reconstructed image.
+        Returns only the first reconstructed sample
         :param x: (Tensor) [B x C x H x W]
         :return: (Tensor) [B x C x H x W]
         """
 
-        return self.forward(x)[0]
+        return self.forward(x)[0][:, 0, :]
