@@ -5,8 +5,5 @@ https://github.com/AntixK/PyTorch-VAE
 
 
 ## experiment result
-https://docs.google.com/spreadsheets/d/1EOCCdw4yMB8mXmU_nxW9Ioh5Gjpij3nNfUNoipZ4DwQ/edit?usp=sharing
-
-
-
+https://github.com/fxnnxc/VAE-MNIST-Experiment/blob/main/VAE_MNIST_Experiment.pdf
 
